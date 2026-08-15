@@ -43,6 +43,7 @@ from aiter.dist.parallel_state import (
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.batched_gemm_op_a8w8 import batched_gemm_a8w8_mxscale
 from aiter.ops.inverse_rope_group_quant import inverse_rope_group_quant
+from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.topk import top_k_per_row_decode, top_k_per_row_prefill
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 from aiter.ops.triton.fusions.fused_clamp_act_mul import (
@@ -149,6 +150,14 @@ _V4_FORCE_UE8M0_QUANT = os.environ.get("V4_FORCE_UE8M0_QUANT", "0") == "1"
 _V4_USE_REF_QUANT = os.environ.get("V4_USE_REF_QUANT", "0") == "1"
 # Fused-kernel switches. Default off; flip via env to A/B against the eager path.
 _V4_USE_TRITON_FUSION = os.environ.get("ATOM_V4_USE_TRITON_FUSION", "0") == "1"
+# Bake wo_a into the (16, 16) MFMA-fragment layout at load so the mxscale BMM can
+# take aiter's preshuffled-B kids, which read B straight into the MFMA registers
+# instead of staging it through LDS. Off by default: it needs a tuned table of
+# preshuffled kids (AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE), and the
+# layout is not detectable downstream -- a shuffled weight is shape-, dtype- and
+# stride-identical to a row-major one, so a half-applied switch would return
+# plausible wrong numbers rather than fail.
+_V4_WO_A_BPRESHUFFLE = os.environ.get("ATOM_V4_WO_A_BPRESHUFFLE", "0") == "1"
 ENABLE_DS_QKNORM_QUANT_FUSION = envs.ATOM_ENABLE_DS_QKNORM_QUANT_FUSION
 SPARSE_INDEXER_LOGITS_BUDGET_MB = envs.ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB
 
@@ -2402,6 +2411,7 @@ class DeepseekV4Attention(nn.Module):
         # Flipped by process_weights_after_loading when wo_a is eligible for the
         # mxscale BMM; off means the BF16 grouped-LoRA path.
         self._wo_a_mxscale = False
+        self._wo_a_b_preshuffled = False
         self._wo_a_fp8_dtype: torch.dtype | None = None
         self._wo_a_w_fp8: torch.Tensor | None = None
         self._wo_a_w_scale: torch.Tensor | None = None
@@ -2537,16 +2547,24 @@ class DeepseekV4Attention(nn.Module):
             self._wo_a_fp8_dtype = w.dtype
             # Cached as module attrs so the forward skips the reshape and the
             # scale conversion on every call.
-            self._wo_a_w_fp8 = w.data.view(G, N, K)
+            wo_a_w = w.data.view(G, N, K)
+            if _V4_WO_A_BPRESHUFFLE:
+                # Same bytes, 16x16-tiled: [G, N, K] -> [G][N/16][K/32][2][16][16].
+                # Shape and strides are unchanged, so nothing downstream sees it;
+                # `b_preshuffled` below is what tells aiter which kids may run.
+                wo_a_w = shuffle_weight(wo_a_w, layout=(16, 16))
+            self._wo_a_w_fp8 = wo_a_w
             self._wo_a_w_scale = _wo_a_block_scale_to_e8m0(scale.data, G)
             self._wo_a_mxscale = True
+            self._wo_a_b_preshuffled = _V4_WO_A_BPRESHUFFLE
             logger.info(
                 "%s: wo_a using fp8 e8m0 mxscale batched GEMM "
-                "(G=%d, N=%d, K=%d, keeping FP8 weight).",
+                "(G=%d, N=%d, K=%d, keeping FP8 weight, b_preshuffled=%s).",
                 self.layer_name,
                 G,
                 N,
                 K,
+                _V4_WO_A_BPRESHUFFLE,
             )
             # Suppress the LinearBase CK-layout shuffle, same as the BF16 branch
             # below: the mxscale kernel reads `wo_a.weight` directly and needs
@@ -2761,6 +2779,7 @@ class DeepseekV4Attention(nn.Module):
                 x_scale,
                 self._wo_a_w_scale,
                 dtype=o.dtype,
+                b_preshuffled=self._wo_a_b_preshuffled,
             )
             # Flattened here, like both BF16 branches below: wo_b takes
             # [M, G * o_lora_rank]. Handing it the 3-D tensor instead makes aiter
